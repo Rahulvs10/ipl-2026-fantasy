@@ -7,16 +7,15 @@ calculates fantasy points for every player based on batting, bowling,
 and fielding contributions.
 
 Usage:
-    python fantasy.py <match_number>
-    python fantasy.py 1
+    streamlit run app.py
 """
 
-import sys
 import re
 import requests
+import streamlit as st
+import pandas as pd
 from bs4 import BeautifulSoup
 from collections import defaultdict
-from tabulate import tabulate
 
 SERIES_MATCHES_URL = (
     "https://www.cricbuzz.com/cricket-series/9241/"
@@ -708,21 +707,10 @@ def calculate_fantasy_points(innings_list, registry):
     return players
 
 
-# ── Display ───────────────────────────────────────────────────────────
+# ── Helpers for building DataFrames ───────────────────────────────────
 
-def display_results(players, match_info, innings_list):
-    sorted_players = sorted(
-        players.items(), key=lambda x: x[1]["total"], reverse=True
-    )
-
-    print()
-    print("=" * 80)
-    if match_info.get("result"):
-        print(f"  {match_info['result']}")
-    print(f"  {match_info['url']}")
-    print("=" * 80)
-
-    # Build quick-lookup for batting/bowling raw stats
+def _build_team_df(players, innings_list, team):
+    """Build a DataFrame for one team's players."""
     bat_stats = {}
     bowl_stats = {}
     for inn in innings_list:
@@ -731,117 +719,152 @@ def display_results(players, match_info, innings_list):
         for b in inn["bowling"]:
             bowl_stats[b["name"]] = b
 
-    for team in match_info.get("teams", []):
-        team_players = [
-            (name, data)
-            for name, data in sorted_players
-            if data["team"] == team
-        ]
-        if not team_players:
+    rows = []
+    for name, data in sorted(
+        players.items(), key=lambda x: x[1]["total"], reverse=True
+    ):
+        if data["team"] != team:
             continue
 
-        print(f"\n  {team}")
-        print(f"  {'─' * 76}")
+        bat = bat_stats.get(name)
+        bowl = bowl_stats.get(name)
+        parts = []
+        if bat:
+            s = f"{bat['runs']}({bat['balls']})"
+            if bat["fours"] or bat["sixes"]:
+                s += f"  {bat['fours']}×4 {bat['sixes']}×6"
+            parts.append(s)
+        if bowl and (bowl["wickets"] or bowl["overs"] != "0"):
+            parts.append(f"{bowl['wickets']}/{bowl['runs']} ({bowl['overs']}ov)")
 
-        table_rows = []
-        for name, data in team_players:
-            bat = bat_stats.get(name)
-            bowl = bowl_stats.get(name)
-            stat_parts = []
-            if bat:
-                s = f"{bat['runs']}({bat['balls']})"
-                if bat["fours"] or bat["sixes"]:
-                    s += f" {bat['fours']}×4 {bat['sixes']}×6"
-                stat_parts.append(s)
-            if bowl and (bowl["wickets"] or bowl["overs"] != "0"):
-                stat_parts.append(
-                    f"{bowl['wickets']}/{bowl['runs']} ({bowl['overs']}ov)"
-                )
-            stats_str = "  |  ".join(stat_parts) if stat_parts else "-"
+        rows.append({
+            "Player": name,
+            "Stats": "  |  ".join(parts) if parts else "-",
+            "Bat": data["bat_pts"],
+            "Bowl": data["bowl_pts"],
+            "Field": data["field_pts"],
+            "Total": data["total"],
+        })
 
-            table_rows.append([
-                name,
-                stats_str,
-                data["bat_pts"],
-                data["bowl_pts"],
-                data["field_pts"],
-                data["total"],
-            ])
-
-        print(tabulate(
-            table_rows,
-            headers=["Player", "Stats", "Bat", "Bowl", "Field", "Total"],
-            tablefmt="simple",
-            colalign=("left", "left", "right", "right", "right", "right"),
-        ))
-
-    # Combined leaderboard
-    print(f"\n{'═' * 80}")
-    print("  FANTASY POINTS LEADERBOARD")
-    print(f"{'═' * 80}")
-
-    table_rows = []
-    for rank, (name, data) in enumerate(sorted_players, 1):
-        table_rows.append([
-            rank,
-            name,
-            match_info.get("team_abbr", {}).get(data["team"], data["team"][:3].upper()),
-            data["bat_pts"],
-            data["bowl_pts"],
-            data["field_pts"],
-            data["total"],
-        ])
-
-    print(tabulate(
-        table_rows,
-        headers=["#", "Player", "Team", "Bat", "Bowl", "Field", "Total"],
-        tablefmt="simple",
-        colalign=("right", "left", "center", "right", "right", "right", "right"),
-    ))
-    print()
+    return pd.DataFrame(rows)
 
 
-# ── Main ──────────────────────────────────────────────────────────────
+def _build_leaderboard_df(players, match_info):
+    """Build a combined leaderboard DataFrame."""
+    abbr = match_info.get("team_abbr", {})
+    rows = []
+    for rank, (name, data) in enumerate(
+        sorted(players.items(), key=lambda x: x[1]["total"], reverse=True), 1
+    ):
+        rows.append({
+            "#": rank,
+            "Player": name,
+            "Team": abbr.get(data["team"], data["team"][:3].upper()),
+            "Bat": data["bat_pts"],
+            "Bowl": data["bowl_pts"],
+            "Field": data["field_pts"],
+            "Total": data["total"],
+        })
+    return pd.DataFrame(rows)
+
+
+# ── Streamlit UI ──────────────────────────────────────────────────────
+
+@st.cache_data(ttl=120, show_spinner=False)
+def cached_match_links():
+    return _fetch_match_links()
+
+
+@st.cache_data(ttl=300, show_spinner="Fetching scorecard…")
+def cached_scorecard(url):
+    return parse_scorecard(url)
+
 
 def main():
-    if len(sys.argv) > 2:
-        print(f"Usage: python {sys.argv[0]} [match_number]")
-        print(f"  python {sys.argv[0]}       # latest completed match")
-        print(f"  python {sys.argv[0]} 1     # specific match number")
-        sys.exit(1)
+    st.set_page_config(page_title="IPL 2026 Fantasy Points", layout="wide")
+    st.title("🏏 IPL 2026 Fantasy Points Calculator")
 
-    if len(sys.argv) == 2:
-        try:
-            match_number = int(sys.argv[1])
-        except ValueError:
-            print("Error: match_number must be an integer")
-            sys.exit(1)
+    # ── Sidebar: match selection ──────────────────────────────────
+    with st.sidebar:
+        st.header("Match Selection")
+        use_latest = st.toggle("Use latest completed match", value=True)
 
-        print(f"Looking up IPL 2026 Match #{match_number}...")
-        url = find_match_scorecard_url(match_number)
-        if not url:
-            print(f"Error: Could not find Match #{match_number} on the IPL 2026 schedule.")
-            print("The match may not have been played yet or is not listed.")
-            sys.exit(1)
-    else:
-        print("Finding latest completed IPL 2026 match...")
-        match_number, url = find_latest_completed_match()
-        if not url:
-            print("Error: No completed IPL 2026 matches found.")
-            sys.exit(1)
-        print(f"Latest completed match: #{match_number}")
+        if use_latest:
+            with st.spinner("Finding latest completed match…"):
+                match_number, url = find_latest_completed_match()
+            if not url:
+                st.error("No completed IPL 2026 matches found yet.")
+                st.stop()
+            st.success(f"Match #{match_number}")
+        else:
+            match_number = st.number_input(
+                "Match number", min_value=1, max_value=70, value=1, step=1
+            )
+            url = find_match_scorecard_url(match_number)
+            if not url:
+                st.error(
+                    f"Match #{match_number} not found. "
+                    "It may not have been played yet."
+                )
+                st.stop()
 
-    print(f"Fetching scorecard: {url}")
-    match_info, innings_list, registry = parse_scorecard(url)
+        st.caption(f"[Scorecard on Cricbuzz]({url.replace('/live-cricket-scorecard/', '/live-cricket-scores/')})")
+
+    # ── Fetch & calculate ─────────────────────────────────────────
+    match_info, innings_list, registry = cached_scorecard(url)
 
     if not innings_list:
-        print("Error: Could not parse scorecard. The match may still be in progress.")
-        sys.exit(1)
+        st.error("Could not parse scorecard. The match may still be in progress.")
+        st.stop()
 
-    print("Calculating fantasy points...")
     players = calculate_fantasy_points(innings_list, registry)
 
-    display_results(players, match_info, innings_list)
+    # ── Match header ──────────────────────────────────────────────
+    if match_info.get("result"):
+        st.markdown(f"**{match_info['result']}**")
+
+    # ── Team tabs ─────────────────────────────────────────────────
+    teams = match_info.get("teams", [])
+    abbr = match_info.get("team_abbr", {})
+    tab_labels = [abbr.get(t, t[:3].upper()) for t in teams] + ["Leaderboard"]
+    tabs = st.tabs(tab_labels)
+
+    for i, team in enumerate(teams):
+        with tabs[i]:
+            df = _build_team_df(players, innings_list, team)
+            if df.empty:
+                st.info("No player data available.")
+                continue
+
+            st.subheader(team)
+            st.dataframe(
+                df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Total": st.column_config.NumberColumn(format="%d"),
+                    "Bat": st.column_config.NumberColumn(format="%d"),
+                    "Bowl": st.column_config.NumberColumn(format="%d"),
+                    "Field": st.column_config.NumberColumn(format="%d"),
+                },
+            )
+
+    # ── Combined leaderboard ──────────────────────────────────────
+    with tabs[-1]:
+        st.subheader("Fantasy Points Leaderboard")
+        lb = _build_leaderboard_df(players, match_info)
+        st.dataframe(
+            lb,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "#": st.column_config.NumberColumn(format="%d", width="small"),
+                "Total": st.column_config.NumberColumn(format="%d"),
+                "Bat": st.column_config.NumberColumn(format="%d"),
+                "Bowl": st.column_config.NumberColumn(format="%d"),
+                "Field": st.column_config.NumberColumn(format="%d"),
+            },
+        )
 
 
 if __name__ == "__main__":
