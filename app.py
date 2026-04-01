@@ -2,8 +2,8 @@
 """
 IPL 2026 Fantasy Points Calculator
 
-Uses the ESPN Cricinfo API to fetch scorecard data and calculate
-fantasy points for every player based on batting, bowling,
+Uses the ESPN Cricinfo API to fetch scorecard data for an IPL 2026 match and
+calculates fantasy points for every player based on batting, bowling,
 and fielding contributions.
 
 Usage:
@@ -54,7 +54,27 @@ FIELD_STUMPING = 12
 FIELD_RUNOUT_DIRECT = 12
 FIELD_RUNOUT_PARTIAL = 6
 
-DUCK_EXEMPT_POSITION = 8
+BOWLERS = {
+    "Noor Ahmed", "Mitchell Starc", "Arshad Khan", "Varun Chakravarthy",
+    "Mayank Yadav", "Mitchell Santner", "Arshdeep Singh", "Jofra Archer",
+    "Josh Hazlewood", "Shivam Mavi", "Khaleel Ahmed", "T Natarajan",
+    "Kagiso Rabada", "Navdeep Saini", "Avesh Khan", "Trent Boult",
+    "Yuzvendra Chahal", "Tushar Deshpande", "Bhuvneshwar Kumar",
+    "Brydon Carse", "Anshul Kamboj", "Mukesh Kumar", "Mohammed Siraj",
+    "Umran Malik", "Mohsin Khan", "Jasprit Bumrah", "Vyshak Vijaykumar",
+    "Sandeep Sharma", "Rasikh Salam", "Pat Cummins", "Matt Henry",
+    "Dushmantha Chameera", "Prasidh Krishna", "Matheesha Pathirana",
+    "Murugan Siddharth", "Deepak Chahar", "Yash Thakur", "Kwena Maphaka",
+    "Suyash Sharma", "Jaydev Unadkat", "Spencer Johnson", "Kuldeep Yadav",
+    "Ishant Sharma", "Vaibhav Arora", "Digvesh Rathi", "Ashwani Kumar",
+    "Xavier Bartlett", "Nandre Burger", "Nuwan Thushara", "Eshan Malinga",
+    "Rahul Chahar", "Auqib Nabi", "Rashid Khan", "Kartik Tyagi",
+    "Mohammed Shami", "Mayank Markande", "Lockie Ferguson", "Ravi Bishnoi",
+    "Jacob Duffy", "Zeeshan Ansari", "Kyle Jamieson", "Sai Kishore",
+    "Anrich Nortje", "Shardul Thakur", "Ben Dwarshuis", "Adam Milne",
+    "Lungi Ngidi", "Wanindu Hasaranga", "Allah Ghazanfar", "Pravin Dubey",
+    "Kuldeep Sen", "Vignesh Puthur",
+}
 
 
 # ── Utilities ─────────────────────────────────────────────────────────
@@ -260,9 +280,12 @@ def find_match_by_number(match_number):
     return None
 
 
-def find_latest_completed_match():
-    """Return the latest completed match dict, or None."""
+def find_current_or_latest_match():
+    """Return the live match if one is ongoing, otherwise the latest completed match."""
     matches = cached_schedule()
+    live = [m for m in matches if m["state"] == "in"]
+    if live:
+        return live[0]
     completed = [m for m in matches if m["state"] == "post"]
     return completed[-1] if completed else None
 
@@ -526,7 +549,7 @@ def calculate_fantasy_points(innings_list, resolver):
                 details.append("30+ bonus")
 
             is_out = dismissal["type"] not in ("not_out", "retired")
-            if runs == 0 and is_out and pos < DUCK_EXEMPT_POSITION:
+            if runs == 0 and is_out and name not in BOWLERS:
                 pts += BAT_DUCK
                 details.append("duck")
 
@@ -709,14 +732,21 @@ def _build_leaderboard_df(players, match_info):
 
 # ── Streamlit UI ──────────────────────────────────────────────────────
 
-@st.cache_data(ttl=120, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def cached_schedule():
     return fetch_schedule()
 
 
 @st.cache_data(ttl=300, show_spinner="Fetching scorecard…")
-def cached_scorecard(event_id):
+def cached_scorecard(event_id, _live=False):
     return parse_scorecard(event_id)
+
+
+def get_scorecard(event_id, is_live=False):
+    """Wrapper that uses a short TTL for live matches."""
+    if is_live:
+        cached_scorecard.clear()
+    return cached_scorecard(event_id, _live=is_live)
 
 
 def main():
@@ -725,19 +755,21 @@ def main():
 
     with st.sidebar:
         st.header("Match Selection")
-        use_latest = st.toggle("Use latest completed match", value=True)
+        use_auto = st.toggle("Auto (live or latest)", value=True)
 
-        if use_latest:
-            with st.spinner("Finding latest completed match…"):
-                match = find_latest_completed_match()
+        if use_auto:
+            with st.spinner("Finding match…"):
+                match = find_current_or_latest_match()
             if not match:
-                st.error("No completed IPL 2026 matches found yet.")
+                st.error("No live or completed IPL 2026 matches found yet.")
                 st.stop()
-            st.success(
-                f"Match #{match['match_number']} – "
-                f"{match['team_abbr'].get(match['teams'][0], '?')} vs "
-                f"{match['team_abbr'].get(match['teams'][1], '?')}"
-            )
+            label = "LIVE" if match["state"] == "in" else f"Match #{match['match_number']}"
+            abbr0 = match["team_abbr"].get(match["teams"][0], "?")
+            abbr1 = match["team_abbr"].get(match["teams"][1], "?")
+            if match["state"] == "in":
+                st.info(f"🔴 {label} – {abbr0} vs {abbr1}")
+            else:
+                st.success(f"{label} – {abbr0} vs {abbr1}")
             event_id = match["event_id"]
         else:
             match_number = st.number_input(
@@ -762,11 +794,15 @@ def main():
         )
         st.caption(f"[Scorecard on ESPNcricinfo]({scorecard_url})")
 
-    match_info, innings_list, resolver = cached_scorecard(event_id)
+    is_live = match["state"] == "in"
+    match_info, innings_list, resolver = get_scorecard(event_id, is_live=is_live)
 
     if not innings_list:
-        st.error("Could not parse scorecard. The match may still be in progress.")
+        st.error("Could not parse scorecard — no innings data available yet.")
         st.stop()
+
+    if is_live:
+        st.caption("🔴 Match in progress — points are provisional")
 
     players = calculate_fantasy_points(innings_list, resolver)
 
