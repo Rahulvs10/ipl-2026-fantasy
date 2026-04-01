@@ -2,8 +2,8 @@
 """
 IPL 2026 Fantasy Points Calculator
 
-Scrapes the Cricbuzz scorecard for a given IPL 2026 match number and
-calculates fantasy points for every player based on batting, bowling,
+Uses the ESPN Cricinfo API to fetch scorecard data and calculate
+fantasy points for every player based on batting, bowling,
 and fielding contributions.
 
 Usage:
@@ -11,23 +11,24 @@ Usage:
 """
 
 import re
+import html
 import requests
 import streamlit as st
 import pandas as pd
-from bs4 import BeautifulSoup
 from collections import defaultdict
 
-SERIES_MATCHES_URL = (
-    "https://www.cricbuzz.com/cricket-series/9241/"
-    "indian-premier-league-2026/matches"
+# ── API Configuration ────────────────────────────────────────────────
+
+SERIES_ID = "1510719"
+SCOREBOARD_URL = (
+    "https://site.web.api.espn.com/apis/site/v2/sports/cricket/8048/scoreboard"
+    f"?lang=en&region=us&league={SERIES_ID}&limit=70&dates=2026"
 )
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/131.0.0.0 Safari/537.36"
-    ),
-}
+SUMMARY_URL_TEMPLATE = (
+    "https://site.web.api.espn.com/apis/site/v2/sports/cricket/8048/summary"
+    "?event={event_id}"
+)
+HEADERS = {"User-Agent": "Mozilla/5.0"}
 
 # ── Fantasy Point Values ──────────────────────────────────────────────
 
@@ -36,15 +37,15 @@ BAT_BOUNDARY_BONUS = 1          # per 4 or 6
 BAT_SCORE_30 = 4
 BAT_SCORE_50 = 8
 BAT_SCORE_100 = 12
-BAT_DUCK = 0                   # bowlers excluded (batting pos >= 8)
+BAT_DUCK = -4
 
+BOWL_DOT = 1
 BOWL_WICKET = 20
 BOWL_MAIDEN = 15
-BOWL_BOWLED_LBW = 8             # per dismissal that is bowled or lbw
+BOWL_BOWLED_LBW = 8
 BOWL_3W = 4
 BOWL_4W = 8
 BOWL_5W = 12
-BOWL_HATTRICK = 15
 BOWL_ECO_LT6 = 4               # economy < 6 (min 2 overs)
 BOWL_ECO_LT7 = 2               # economy >= 6 and < 7 (min 2 overs)
 
@@ -53,7 +54,7 @@ FIELD_STUMPING = 12
 FIELD_RUNOUT_DIRECT = 12
 FIELD_RUNOUT_PARTIAL = 6
 
-DUCK_EXEMPT_POSITION = 8        # batting position >= this is exempt
+DUCK_EXEMPT_POSITION = 8
 
 
 # ── Utilities ─────────────────────────────────────────────────────────
@@ -66,74 +67,59 @@ def ordinal(n):
     return f"{n}{suffix}"
 
 
-def clean_name(raw):
-    """Remove captain/keeper tags and extra whitespace from a player name."""
-    name = re.sub(r"\s*\(.*?\)\s*", "", raw).strip()
-    name = re.sub(r"\s+", " ", name)
-    return name
-
-
 def parse_overs_to_float(overs_str):
-    """Convert overs string like '3.4' to a float for ball count."""
-    overs_str = overs_str.strip()
+    """Convert overs string like '3.4' to a float (3.4, not 3.666)."""
+    overs_str = str(overs_str).strip()
     if "." in overs_str:
         whole, part = overs_str.split(".")
         return int(whole) + int(part) / 10
     return float(overs_str)
 
 
-def overs_to_balls(overs_str):
-    overs_str = overs_str.strip()
-    if "." in overs_str:
-        whole, part = overs_str.split(".")
-        return int(whole) * 6 + int(part)
-    return int(overs_str) * 6
-
-
 # ── Name Resolution ──────────────────────────────────────────────────
 
-class PlayerRegistry:
-    """Maps variant names (from dismissal text) to canonical player names."""
+class NameResolver:
+    """Maps short/fielding names (used in dismissal text) to canonical display names."""
 
     def __init__(self):
-        self.canonical_names = {}   # clean_name -> clean_name (identity)
-        self.last_name_index = {}   # last_name -> [clean_name, ...]
+        self.display_names = set()
+        self.fielding_to_display = {}
+        self.last_name_index = {}
 
-    def register(self, raw_name):
-        name = clean_name(raw_name)
-        if name and name not in self.canonical_names:
-            self.canonical_names[name] = name
-            last = name.split()[-1].lower()
-            self.last_name_index.setdefault(last, []).append(name)
-        return name
+    def register(self, display_name, fielding_name=None):
+        self.display_names.add(display_name)
+        if fielding_name and fielding_name != display_name:
+            self.fielding_to_display[fielding_name] = display_name
+        last = display_name.split()[-1].lower()
+        self.last_name_index.setdefault(last, []).append(display_name)
 
     def resolve(self, text_name):
-        """Given a name from dismissal text, find the matching registered player."""
         name = text_name.strip()
-        if name in self.canonical_names:
+        if not name:
             return name
-
+        if name in self.display_names:
+            return name
+        if name in self.fielding_to_display:
+            return self.fielding_to_display[name]
         last = name.split()[-1].lower()
         candidates = self.last_name_index.get(last, [])
         if len(candidates) == 1:
             return candidates[0]
-
         for cand in candidates:
             if name.lower() in cand.lower() or cand.lower() in name.lower():
                 return cand
-
         return name
 
 
 # ── Dismissal Parsing ─────────────────────────────────────────────────
 
-def parse_dismissal(text, registry):
+def parse_dismissal(text, resolver):
     """
-    Parse a Cricbuzz dismissal string and return a dict with:
+    Parse a dismissal string and return a dict with:
       type: 'caught' | 'bowled' | 'lbw' | 'stumped' | 'run_out' |
             'caught_and_bowled' | 'hit_wicket' | 'not_out' | 'retired' | 'other'
       bowler: str | None
-      fielders: [(name, role)]   role = 'catch' | 'stumping' | 'runout_direct' | 'runout_partial'
+      fielders: [(name, role)]
       is_sub_fielder: bool
     """
     text = text.strip()
@@ -152,392 +138,341 @@ def parse_dismissal(text, registry):
         result["type"] = "retired"
         return result
 
-    # caught and bowled: "c & b Player"
     m = re.match(r"c\s*&\s*b\s+(.+)", text)
     if m:
-        bowler = registry.resolve(m.group(1).strip())
+        bowler = resolver.resolve(m.group(1).strip())
         result["type"] = "caught_and_bowled"
         result["bowler"] = bowler
         result["fielders"] = [(bowler, "catch")]
         return result
 
-    # caught by sub: "c sub (Name) b Bowler" or "c †Name b Bowler"
     m = re.match(r"c\s+sub\s*\((.+?)\)\s*b\s+(.+)", text, re.IGNORECASE)
     if m:
         result["type"] = "caught"
-        result["bowler"] = registry.resolve(m.group(2).strip())
+        result["bowler"] = resolver.resolve(m.group(2).strip())
         result["is_sub_fielder"] = True
         return result
 
-    # stumped by sub
     m = re.match(r"st\s+sub\s*\((.+?)\)\s*b\s+(.+)", text, re.IGNORECASE)
     if m:
         result["type"] = "stumped"
-        result["bowler"] = registry.resolve(m.group(2).strip())
+        result["bowler"] = resolver.resolve(m.group(2).strip())
         result["is_sub_fielder"] = True
         return result
 
-    # regular caught: "c Fielder b Bowler"
     m = re.match(r"c\s+(.+?)\s+b\s+(.+)", text)
     if m:
-        fielder = registry.resolve(m.group(1).strip())
-        bowler = registry.resolve(m.group(2).strip())
+        fielder = resolver.resolve(m.group(1).strip())
+        bowler = resolver.resolve(m.group(2).strip())
         result["type"] = "caught"
         result["bowler"] = bowler
         result["fielders"] = [(fielder, "catch")]
         return result
 
-    # stumped: "st Fielder b Bowler"
     m = re.match(r"st\s+(.+?)\s+b\s+(.+)", text)
     if m:
-        fielder = registry.resolve(m.group(1).strip())
-        bowler = registry.resolve(m.group(2).strip())
+        fielder = resolver.resolve(m.group(1).strip())
+        bowler = resolver.resolve(m.group(2).strip())
         result["type"] = "stumped"
         result["bowler"] = bowler
         result["fielders"] = [(fielder, "stumping")]
         return result
 
-    # run out with multiple fielders: "run out (Name1/Name2)"
     m = re.match(r"run\s+out\s*\((.+?)\)", text, re.IGNORECASE)
     if m:
         names_str = m.group(1).strip()
-
         if "sub" in names_str.lower():
             result["type"] = "run_out"
             result["is_sub_fielder"] = True
             return result
-
         names = [n.strip() for n in re.split(r"[/]", names_str) if n.strip()]
         result["type"] = "run_out"
         if len(names) == 1:
-            result["fielders"] = [(registry.resolve(names[0]), "runout_direct")]
+            result["fielders"] = [(resolver.resolve(names[0]), "runout_direct")]
         else:
             result["fielders"] = [
-                (registry.resolve(n), "runout_partial") for n in names
+                (resolver.resolve(n), "runout_partial") for n in names
             ]
         return result
 
-    # bowled: "b Bowler"
     m = re.match(r"^b\s+(.+)", text)
     if m:
         result["type"] = "bowled"
-        result["bowler"] = registry.resolve(m.group(1).strip())
+        result["bowler"] = resolver.resolve(m.group(1).strip())
         return result
 
-    # lbw: "lbw b Bowler"
     m = re.match(r"lbw\s+b\s+(.+)", text, re.IGNORECASE)
     if m:
         result["type"] = "lbw"
-        result["bowler"] = registry.resolve(m.group(1).strip())
+        result["bowler"] = resolver.resolve(m.group(1).strip())
         return result
 
-    # hit wicket: "hit wicket b Bowler"
     m = re.match(r"hit\s+wicket\s+b\s+(.+)", text, re.IGNORECASE)
     if m:
         result["type"] = "hit_wicket"
-        result["bowler"] = registry.resolve(m.group(1).strip())
+        result["bowler"] = resolver.resolve(m.group(1).strip())
         return result
 
     return result
 
 
-# ── Scorecard Scraping ────────────────────────────────────────────────
+# ── ESPN API Data Fetching ────────────────────────────────────────────
 
-COMPLETED_RE = re.compile(r"\bwon\b|tied|no result|abandon", re.IGNORECASE)
-MATCH_NUM_RE = re.compile(r"(\d+)(?:st|nd|rd|th)-match-indian-premier-league-2026")
+def fetch_schedule():
+    """Fetch all IPL 2026 match events from the ESPN API.
 
-
-def _fetch_match_links():
-    """Return a list of (match_number, href, link_text) for all IPL 2026 matches."""
-    resp = requests.get(SERIES_MATCHES_URL, headers=HEADERS, timeout=15)
+    Returns a list of dicts:
+        {match_number, event_id, teams, team_abbr, state, status_detail}
+    """
+    resp = requests.get(SCOREBOARD_URL, headers=HEADERS, timeout=15)
     resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "lxml")
+    data = resp.json()
 
     matches = []
-    seen = set()
-    for link in soup.find_all("a", href=True):
-        href = link["href"]
-        if "indian-premier-league-2026" not in href or "-match-" not in href:
-            continue
-        if href in seen:
-            continue
-        seen.add(href)
+    for i, event in enumerate(data.get("events", []), 1):
+        comp = event["competitions"][0]
+        status_type = comp["status"]["type"]
 
-        m = MATCH_NUM_RE.search(href)
-        if not m:
-            continue
-        num = int(m.group(1))
-        text = link.get_text(strip=True)
-        matches.append((num, href, text))
+        teams = []
+        team_abbr = {}
+        for c in comp["competitors"]:
+            tname = c["team"]["displayName"]
+            teams.append(tname)
+            team_abbr[tname] = c["team"]["abbreviation"]
+
+        matches.append({
+            "match_number": i,
+            "event_id": event["id"],
+            "teams": teams,
+            "team_abbr": team_abbr,
+            "state": status_type.get("state", ""),
+            "status_detail": status_type.get("detail", ""),
+        })
 
     return matches
 
 
-def find_match_scorecard_url(match_number):
-    """Find the scorecard URL for a specific IPL 2026 match number."""
-    for num, href, _ in _fetch_match_links():
-        if num == match_number:
-            scorecard_url = href.replace(
-                "/live-cricket-scores/", "/live-cricket-scorecard/"
-            )
-            if not scorecard_url.startswith("http"):
-                scorecard_url = "https://www.cricbuzz.com" + scorecard_url
-            return scorecard_url
+def find_match_by_number(match_number):
+    """Find the match dict for a given 1-indexed match number."""
+    matches = cached_schedule()
+    if 1 <= match_number <= len(matches):
+        return matches[match_number - 1]
     return None
 
 
 def find_latest_completed_match():
-    """Find the most recent completed IPL 2026 match. Returns (match_number, scorecard_url) or (None, None)."""
-    matches = _fetch_match_links()
-    completed = [
-        (num, href) for num, href, text in matches if COMPLETED_RE.search(text)
-    ]
-    if not completed:
-        return None, None
-
-    completed.sort(key=lambda x: x[0], reverse=True)
-    num, href = completed[0]
-    scorecard_url = href.replace(
-        "/live-cricket-scores/", "/live-cricket-scorecard/"
-    )
-    if not scorecard_url.startswith("http"):
-        scorecard_url = "https://www.cricbuzz.com" + scorecard_url
-    return num, scorecard_url
+    """Return the latest completed match dict, or None."""
+    matches = cached_schedule()
+    completed = [m for m in matches if m["state"] == "post"]
+    return completed[-1] if completed else None
 
 
-def parse_scorecard(url):
-    """
-    Fetch and parse the full scorecard from the given URL.
+# ── Scorecard Parsing ─────────────────────────────────────────────────
+
+def _extract_player_stats(player, period):
+    """Extract all stats for a player in a given innings period."""
+    for ls_period in player.get("linescores", []):
+        if ls_period.get("period") != period:
+            continue
+        inner_ls = ls_period.get("linescores", [])
+        if not inner_ls:
+            return {}
+
+        stats = {}
+        for cat in inner_ls[0].get("statistics", {}).get("categories", []):
+            for s in cat.get("stats", []):
+                name = s["name"]
+                val = s.get("value")
+                dv = s.get("displayValue", "")
+
+                if name == "overs":
+                    stats[name] = dv if dv and dv != "-" else "0"
+                    continue
+
+                if isinstance(val, (int, float)):
+                    stats[name] = val
+                elif isinstance(val, str):
+                    if val in ("", "-"):
+                        stats[name] = 0
+                    else:
+                        try:
+                            stats[name] = int(val)
+                        except ValueError:
+                            try:
+                                stats[name] = float(val)
+                            except ValueError:
+                                stats[name] = val
+                elif val is None:
+                    if dv in ("", "-"):
+                        stats[name] = 0
+                    else:
+                        try:
+                            stats[name] = int(dv)
+                        except ValueError:
+                            try:
+                                stats[name] = float(dv)
+                            except ValueError:
+                                stats[name] = dv
+                else:
+                    stats[name] = val
+        return stats
+    return {}
+
+
+def parse_scorecard(event_id):
+    """Fetch and parse the full scorecard from the ESPN summary API.
 
     Returns:
-        match_info: dict with match title, teams, result
-        innings_list: list of dicts, each with:
-            team: str
-            batting: [{name, runs, balls, fours, sixes, dismissal_text, position}]
-            bowling: [{name, overs, maidens, runs, wickets, economy}]
-            dnb: [name, ...]            (did not bat)
+        match_info  – dict with teams, team_abbr, result, event_id
+        innings_list – list of innings dicts (batting, bowling, dnb)
+        resolver     – NameResolver for mapping short names
     """
+    url = SUMMARY_URL_TEMPLATE.format(event_id=event_id)
     resp = requests.get(url, headers=HEADERS, timeout=15)
     resp.raise_for_status()
-    soup = BeautifulSoup(resp.text, "lxml")
+    data = resp.json()
 
-    # Find innings divs (pattern: scard-team-{id}-innings-{n})
-    seen_ids = set()
-    innings_divs = []
-    team_headers = []
+    header = data["header"]
+    comp = header["competitions"][0]
+    status = comp["status"]["type"]
 
-    for div in soup.find_all("div", id=re.compile(r"^scard-team-\d+-innings-\d+$")):
-        div_id = div["id"]
-        if div_id not in seen_ids:
-            seen_ids.add(div_id)
-            innings_divs.append(div)
-
-    for div in soup.find_all("div", id=re.compile(r"^team-\d+-innings-\d+$")):
-        div_id = div["id"]
-        if div_id not in seen_ids:
-            seen_ids.add(div_id)
-            team_headers.append(div)
-
-    # Extract team names and short codes from header child divs:
-    # child[0] = short code (e.g. "SRH"), child[1] = full name, child[2] = score
-    team_names = []
-    team_short = []
-    for hdr in team_headers:
-        child_divs = [
-            c for c in hdr.children
-            if hasattr(c, "name") and c.name == "div"
-        ]
-        if len(child_divs) >= 2:
-            team_short.append(child_divs[0].get_text(strip=True))
-            team_names.append(child_divs[1].get_text(strip=True))
-        else:
-            text = hdr.get_text(strip=True)
-            team_names.append(text)
-            team_short.append(text[:3].upper())
-
-    # Extract match result from page
-    result_text = ""
-    result_div = soup.find("div", string=re.compile(r"won by|Match tied|No result", re.IGNORECASE))
-    if result_div:
-        result_text = result_div.get_text(strip=True)
-    else:
-        for el in soup.find_all(string=re.compile(r"won by|Match tied|No result", re.IGNORECASE)):
-            result_text = el.strip()
-            break
-
+    teams = []
     team_abbr = {}
-    for i in range(min(len(team_names), len(team_short))):
-        team_abbr[team_names[i]] = team_short[i]
+    for c in comp["competitors"]:
+        tname = c["team"]["displayName"]
+        teams.append(tname)
+        team_abbr[tname] = c["team"]["abbreviation"]
+
+    result_text = ""
+    status_full = comp.get("status", {})
+    if status.get("state") == "post":
+        result_text = (
+            status_full.get("summary", "")
+            or status.get("detail", "")
+        )
 
     match_info = {
-        "url": url,
-        "result": result_text,
-        "teams": team_names[:2] if len(team_names) >= 2 else [],
+        "teams": teams,
         "team_abbr": team_abbr,
+        "result": result_text,
+        "event_id": event_id,
     }
 
-    registry = PlayerRegistry()
-    innings_list = []
+    # ── Build name resolver from rosters ──────────────────────────
+    resolver = NameResolver()
+    rosters = data.get("rosters", [])
+    team_roster_map = {}
+    for roster_entry in rosters:
+        tname = roster_entry["team"]["displayName"]
+        players = roster_entry.get("roster", [])
+        team_roster_map[tname] = players
+        for p in players:
+            dn = p["athlete"]["displayName"]
+            fn = p["athlete"].get("fieldingName", "")
+            resolver.register(dn, fn or None)
 
-    # Only process the first 2 innings (skip Super Over if any)
-    for idx, innings_div in enumerate(innings_divs[:2]):
-        team = team_names[idx] if idx < len(team_names) else f"Team {idx + 1}"
-        sections = innings_div.find_all("div", class_="mb-2", recursive=False)
+    # ── Determine batting team per period ─────────────────────────
+    batting_team_by_period = {}
+    for c in comp["competitors"]:
+        tname = c["team"]["displayName"]
+        for ls in c.get("linescores", []):
+            if ls.get("isBatting"):
+                batting_team_by_period[ls["period"]] = tname
+
+    # ── Collect dismissal text from wicket data ───────────────────
+    dismissal_text_map = {}  # {period: {batter_name: shortText}}
+
+    for c in comp["competitors"]:
+        for ls in c.get("linescores", []):
+            if not ls.get("isBatting"):
+                continue
+            period = ls["period"]
+
+            wicket_by_num = {}
+            overs_sets = ls.get("statistics", {}).get("overs", [])
+            for overs_set in (overs_sets if isinstance(overs_sets, list) else []):
+                if not isinstance(overs_set, list):
+                    continue
+                for over_data in overs_set:
+                    for w in over_data.get("wicket", []):
+                        wnum = w.get("number", 0)
+                        short_text = html.unescape(w.get("shortText", "")).strip()
+                        short_text = short_text.replace("\u2020", "")
+                        wicket_by_num[wnum] = short_text
+
+            fow_by_num = {}
+            for f in ls.get("fow", []):
+                wnum = f.get("wicketNumber", 0)
+                batter = f.get("athlete", {}).get("displayName", "")
+                fow_by_num[wnum] = batter
+
+            dtm = {}
+            for wnum, batter_name in fow_by_num.items():
+                if wnum in wicket_by_num:
+                    dtm[batter_name] = wicket_by_num[wnum]
+            dismissal_text_map[period] = dtm
+
+    # ── Build innings list ────────────────────────────────────────
+    innings_list = []
+    for period in sorted(batting_team_by_period.keys()):
+        if period > 2:
+            break
+
+        batting_team = batting_team_by_period[period]
+        bowling_team = next((t for t in teams if t != batting_team), None)
 
         batting = []
-        bowling = []
-        dnb = []
-
-        # Section 0: Batting
-        if len(sections) > 0:
-            batting = _parse_batting_section(sections[0], registry)
-
-        # Section 1: Bowling
-        if len(sections) > 1:
-            bowling = _parse_bowling_section(sections[1], registry)
-
-        innings_list.append({
-            "team": team,
-            "batting": batting,
-            "bowling": bowling,
-            "dnb": dnb,
-        })
-
-    return match_info, innings_list, registry
-
-
-def _parse_batting_section(section, registry):
-    """Parse all batting rows from a batting section div."""
-    rows = []
-    text_xs = section.find("div", class_="text-xs")
-    if not text_xs:
-        return rows
-
-    position = 0
-    for div in text_xs.children:
-        if not hasattr(div, "find"):
-            continue
-
-        classes = " ".join(div.get("class", []))
-
-        if "scorecard-bat-grid" in classes:
-            link = div.find("a", href=re.compile(r"/profiles/"))
-            if not link:
+        for player in team_roster_map.get(batting_team, []):
+            stats = _extract_player_stats(player, period)
+            if not stats or not stats.get("batted"):
                 continue
 
-            raw_name = link.get_text(strip=True)
-            name = registry.register(raw_name)
-            position += 1
+            name = player["athlete"]["displayName"]
+            d_text = dismissal_text_map.get(period, {}).get(name, "not out")
 
-            # Get direct children (div/a elements) of the grid row
-            children = [
-                c for c in div.children
-                if hasattr(c, "name") and c.name in ("div", "a")
-            ]
-
-            # child[0] = container with player name + dismissal
-            # child[1..5] = runs, balls, fours, sixes, SR
-            dismissal_text = ""
-            if children:
-                inner_div = children[0].find("div")
-                if inner_div:
-                    dismissal_text = inner_div.get_text(strip=True)
-
-            stats = [c.get_text(strip=True) for c in children[1:6]]
-
-            runs = int(stats[0]) if len(stats) > 0 and stats[0].isdigit() else 0
-            balls = int(stats[1]) if len(stats) > 1 and stats[1].isdigit() else 0
-            fours = int(stats[2]) if len(stats) > 2 and stats[2].isdigit() else 0
-            sixes = int(stats[3]) if len(stats) > 3 and stats[3].isdigit() else 0
-
-            rows.append({
+            batting.append({
                 "name": name,
-                "runs": runs,
-                "balls": balls,
-                "fours": fours,
-                "sixes": sixes,
-                "dismissal_text": dismissal_text,
-                "position": position,
+                "runs": int(stats.get("runs", 0)),
+                "balls": int(stats.get("ballsFaced", 0)),
+                "fours": int(stats.get("fours", 0)),
+                "sixes": int(stats.get("sixes", 0)),
+                "dismissal_text": d_text,
+                "position": int(stats.get("battingPosition", 0)),
             })
 
-        text = div.get_text(strip=True)
-        if text.startswith("Did not Bat"):
-            for a in div.find_all("a", href=re.compile(r"/profiles/")):
-                registry.register(a.get_text(strip=True))
+        batting.sort(key=lambda x: x["position"])
 
-    return rows
+        bowling = []
+        if bowling_team:
+            for player in team_roster_map.get(bowling_team, []):
+                stats = _extract_player_stats(player, period)
+                if not stats or not stats.get("inningsBowled"):
+                    continue
 
+                name = player["athlete"]["displayName"]
+                bowling.append({
+                    "name": name,
+                    "overs": str(stats.get("overs", "0")),
+                    "maidens": int(stats.get("maidens", 0)),
+                    "runs": int(stats.get("conceded", 0)),
+                    "wickets": int(stats.get("wickets", 0)),
+                    "dots": int(stats.get("dots", 0)),
+                    "economy": float(stats.get("economyRate", 0)),
+                })
 
-def _parse_bowling_section(section, registry):
-    """Parse all bowling rows from a bowling section div."""
-    rows = []
-    text_xs = section.find("div", class_="text-xs")
-    container = text_xs if text_xs else section
-
-    seen = set()
-    for div in container.descendants:
-        if not hasattr(div, "get"):
-            continue
-        classes = " ".join(div.get("class", []))
-        if "scorecard-bowl-grid" not in classes:
-            continue
-
-        link = div.find("a", href=re.compile(r"/profiles/"))
-        if not link:
-            continue
-
-        raw_name = link.get_text(strip=True)
-        name = registry.register(raw_name)
-        if name in seen:
-            continue
-        seen.add(name)
-
-        children = [
-            c for c in div.children
-            if hasattr(c, "name") and c.name in ("div", "a")
-        ]
-        # children: [name_link], overs, maidens, runs, wickets, NB, WD, eco, highlights
-        # But the first child is the <a> link, so stats start at index 1
-        # Actually the <a> is a child, let me get all children including <a>
-        all_children = [
-            c for c in div.children
-            if hasattr(c, "name") and c.name
-        ]
-        # Skip the first <a> (player name) and last <a> (highlights)
-        stat_children = [
-            c for c in all_children
-            if c.name == "div"
-        ]
-        stats = [c.get_text(strip=True) for c in stat_children]
-
-        overs = stats[0] if len(stats) > 0 else "0"
-        maidens = int(stats[1]) if len(stats) > 1 and stats[1].isdigit() else 0
-        runs_conceded = int(stats[2]) if len(stats) > 2 and stats[2].isdigit() else 0
-        wickets = int(stats[3]) if len(stats) > 3 and stats[3].isdigit() else 0
-        economy = 0.0
-        # Economy might be at different positions depending on NB/WD visibility
-        for s in reversed(stats):
-            try:
-                economy = float(s)
-                break
-            except ValueError:
-                continue
-
-        rows.append({
-            "name": name,
-            "overs": overs,
-            "maidens": maidens,
-            "runs": runs_conceded,
-            "wickets": wickets,
-            "economy": economy,
+        innings_list.append({
+            "team": batting_team,
+            "batting": batting,
+            "bowling": bowling,
+            "dnb": [],
         })
 
-    return rows
+    return match_info, innings_list, resolver
 
 
 # ── Fantasy Points Calculation ────────────────────────────────────────
 
-def calculate_fantasy_points(innings_list, registry):
+def calculate_fantasy_points(innings_list, resolver):
     """
     Calculate fantasy points for every player across both innings.
 
@@ -566,23 +501,20 @@ def calculate_fantasy_points(innings_list, registry):
             fours = batter["fours"]
             sixes = batter["sixes"]
             pos = batter["position"]
-            dismissal = parse_dismissal(batter["dismissal_text"], registry)
+            dismissal = parse_dismissal(batter["dismissal_text"], resolver)
 
             pts = 0
             details = []
 
-            # Runs
             pts += runs * BAT_RUN
             if runs > 0:
                 details.append(f"{runs}r")
 
-            # Boundary bonus (4s and 6s)
             boundary_bonus = (fours + sixes) * BAT_BOUNDARY_BONUS
             pts += boundary_bonus
             if boundary_bonus:
                 details.append(f"{fours}×4 {sixes}×6")
 
-            # Milestone bonus (highest applicable tier only)
             if runs >= 100:
                 pts += BAT_SCORE_100
                 details.append("100+ bonus")
@@ -593,7 +525,6 @@ def calculate_fantasy_points(innings_list, registry):
                 pts += BAT_SCORE_30
                 details.append("30+ bonus")
 
-            # Duck penalty (bowlers batting at pos >= 8 are exempt)
             is_out = dismissal["type"] not in ("not_out", "retired")
             if runs == 0 and is_out and pos < DUCK_EXEMPT_POSITION:
                 pts += BAT_DUCK
@@ -606,7 +537,9 @@ def calculate_fantasy_points(innings_list, registry):
         for bowler in innings["bowling"]:
             name = bowler["name"]
             if not players[name]["team"]:
-                opposing = [inn["team"] for inn in innings_list if inn["team"] != team]
+                opposing = [
+                    inn["team"] for inn in innings_list if inn["team"] != team
+                ]
                 players[name]["team"] = opposing[0] if opposing else ""
 
             pts = 0
@@ -614,21 +547,22 @@ def calculate_fantasy_points(innings_list, registry):
 
             wickets = bowler["wickets"]
             maidens = bowler["maidens"]
-            overs_str = bowler["overs"]
+            dots = bowler["dots"]
             economy = bowler["economy"]
-            total_overs = parse_overs_to_float(overs_str)
+            total_overs = parse_overs_to_float(bowler["overs"])
 
-            # Wickets
+            if dots > 0:
+                pts += dots * BOWL_DOT
+                details.append(f"{dots}dot")
+
             if wickets > 0:
                 pts += wickets * BOWL_WICKET
                 details.append(f"{wickets}w")
 
-            # Maidens
             if maidens > 0:
                 pts += maidens * BOWL_MAIDEN
                 details.append(f"{maidens}maiden")
 
-            # Wicket milestone (highest applicable tier only)
             if wickets >= 5:
                 pts += BOWL_5W
                 details.append("5w bonus")
@@ -639,7 +573,6 @@ def calculate_fantasy_points(innings_list, registry):
                 pts += BOWL_3W
                 details.append("3w bonus")
 
-            # Economy bonus (minimum 2 overs)
             if total_overs >= 2:
                 if economy < 6:
                     pts += BOWL_ECO_LT6
@@ -651,9 +584,9 @@ def calculate_fantasy_points(innings_list, registry):
             players[name]["bowl_pts"] += pts
             players[name]["bowling_detail"] = ", ".join(details)
 
-        # ── Bowled / LBW bonus → goes to the bowler ──────────
+        # ── Bowled / LBW bonus → attributed to the bowler ─────
         for batter in innings["batting"]:
-            dismissal = parse_dismissal(batter["dismissal_text"], registry)
+            dismissal = parse_dismissal(batter["dismissal_text"], resolver)
             if dismissal["type"] in ("bowled", "lbw") and dismissal["bowler"]:
                 bowler_name = dismissal["bowler"]
                 players[bowler_name]["bowl_pts"] += BOWL_BOWLED_LBW
@@ -665,15 +598,20 @@ def calculate_fantasy_points(innings_list, registry):
 
         # ── Fielding points ───────────────────────────────────
         for batter in innings["batting"]:
-            dismissal = parse_dismissal(batter["dismissal_text"], registry)
+            dismissal = parse_dismissal(batter["dismissal_text"], resolver)
             if dismissal["is_sub_fielder"]:
                 continue
 
             for fielder_name, role in dismissal["fielders"]:
-                # Fielders belong to the bowling/fielding team
                 if not players[fielder_name]["team"]:
-                    opposing = [inn["team"] for inn in innings_list if inn["team"] != team]
-                    players[fielder_name]["team"] = opposing[0] if opposing else ""
+                    opposing = [
+                        inn["team"]
+                        for inn in innings_list
+                        if inn["team"] != team
+                    ]
+                    players[fielder_name]["team"] = (
+                        opposing[0] if opposing else ""
+                    )
 
                 if role == "catch":
                     players[fielder_name]["field_pts"] += FIELD_CATCH
@@ -691,16 +629,19 @@ def calculate_fantasy_points(innings_list, registry):
                     players[fielder_name]["field_pts"] += FIELD_RUNOUT_DIRECT
                     existing = players[fielder_name]["fielding_detail"]
                     players[fielder_name]["fielding_detail"] = (
-                        f"{existing}, run out (direct)" if existing else "run out (direct)"
+                        f"{existing}, run out (direct)"
+                        if existing
+                        else "run out (direct)"
                     )
                 elif role == "runout_partial":
                     players[fielder_name]["field_pts"] += FIELD_RUNOUT_PARTIAL
                     existing = players[fielder_name]["fielding_detail"]
                     players[fielder_name]["fielding_detail"] = (
-                        f"{existing}, run out (partial)" if existing else "run out (partial)"
+                        f"{existing}, run out (partial)"
+                        if existing
+                        else "run out (partial)"
                     )
 
-    # Compute totals
     for name, p in players.items():
         p["total"] = p["bat_pts"] + p["bowl_pts"] + p["field_pts"]
 
@@ -710,7 +651,6 @@ def calculate_fantasy_points(innings_list, registry):
 # ── Helpers for building DataFrames ───────────────────────────────────
 
 def _build_team_df(players, innings_list, team):
-    """Build a DataFrame for one team's players."""
     bat_stats = {}
     bowl_stats = {}
     for inn in innings_list:
@@ -750,7 +690,6 @@ def _build_team_df(players, innings_list, team):
 
 
 def _build_leaderboard_df(players, match_info):
-    """Build a combined leaderboard DataFrame."""
     abbr = match_info.get("team_abbr", {})
     rows = []
     for rank, (name, data) in enumerate(
@@ -771,59 +710,69 @@ def _build_leaderboard_df(players, match_info):
 # ── Streamlit UI ──────────────────────────────────────────────────────
 
 @st.cache_data(ttl=120, show_spinner=False)
-def cached_match_links():
-    return _fetch_match_links()
+def cached_schedule():
+    return fetch_schedule()
 
 
 @st.cache_data(ttl=300, show_spinner="Fetching scorecard…")
-def cached_scorecard(url):
-    return parse_scorecard(url)
+def cached_scorecard(event_id):
+    return parse_scorecard(event_id)
 
 
 def main():
     st.set_page_config(page_title="IPL 2026 Fantasy Points", layout="wide")
     st.title("🏏 IPL 2026 Fantasy Points Calculator")
 
-    # ── Sidebar: match selection ──────────────────────────────────
     with st.sidebar:
         st.header("Match Selection")
         use_latest = st.toggle("Use latest completed match", value=True)
 
         if use_latest:
             with st.spinner("Finding latest completed match…"):
-                match_number, url = find_latest_completed_match()
-            if not url:
+                match = find_latest_completed_match()
+            if not match:
                 st.error("No completed IPL 2026 matches found yet.")
                 st.stop()
-            st.success(f"Match #{match_number}")
+            st.success(
+                f"Match #{match['match_number']} – "
+                f"{match['team_abbr'].get(match['teams'][0], '?')} vs "
+                f"{match['team_abbr'].get(match['teams'][1], '?')}"
+            )
+            event_id = match["event_id"]
         else:
             match_number = st.number_input(
                 "Match number", min_value=1, max_value=70, value=1, step=1
             )
-            url = find_match_scorecard_url(match_number)
-            if not url:
+            match = find_match_by_number(match_number)
+            if not match:
                 st.error(
-                    f"Match #{match_number} not found. "
-                    "It may not have been played yet."
+                    f"Match #{match_number} not found in the schedule."
                 )
                 st.stop()
+            if match["state"] == "pre":
+                st.error(
+                    f"Match #{match_number} has not started yet."
+                )
+                st.stop()
+            event_id = match["event_id"]
 
-        st.caption(f"[Scorecard on Cricbuzz]({url.replace('/live-cricket-scorecard/', '/live-cricket-scores/')})")
+        scorecard_url = (
+            f"https://www.espncricinfo.com/series/ipl-2026-{SERIES_ID}"
+            f"/{event_id}/full-scorecard"
+        )
+        st.caption(f"[Scorecard on ESPNcricinfo]({scorecard_url})")
 
-    # ── Fetch & calculate ─────────────────────────────────────────
-    match_info, innings_list, registry = cached_scorecard(url)
+    match_info, innings_list, resolver = cached_scorecard(event_id)
 
     if not innings_list:
         st.error("Could not parse scorecard. The match may still be in progress.")
         st.stop()
 
-    players = calculate_fantasy_points(innings_list, registry)
+    players = calculate_fantasy_points(innings_list, resolver)
 
-    # ── Match header ──────────────────────────────────────────────
     if match_info.get("result"):
         st.markdown(f"**{match_info['result']}**")
 
-    # ── Team tabs ─────────────────────────────────────────────────
     teams = match_info.get("teams", [])
     abbr = match_info.get("team_abbr", {})
     tab_labels = [abbr.get(t, t[:3].upper()) for t in teams] + ["Leaderboard"]
@@ -849,7 +798,6 @@ def main():
                 },
             )
 
-    # ── Combined leaderboard ──────────────────────────────────────
     with tabs[-1]:
         st.subheader("Fantasy Points Leaderboard")
         lb = _build_leaderboard_df(players, match_info)
