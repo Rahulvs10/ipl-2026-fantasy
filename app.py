@@ -64,7 +64,7 @@ FIELD_RUNOUT_PARTIAL = 6
 FANTASY_TEAMS = {
     "VS": [
         "Karthik Sharma", "Prashant Veer", "Kuldeep Yadav", "Sai Sudharsan",
-        "Mohd. Siraj", "Cameron Green", "Ajinkya Rahane", "Wanindu Hasaranga",
+        "Mohammed Siraj", "Cameron Green", "Ajinkya Rahane", "Wanindu Hasaranga",
         "Suryakumar Yadav", "Robin Minz", "Prabhsimran Singh", "Yuzvendra Chahal",
         "Ravindra Jadeja", "Devdut Padikkal", "Krunal Pandya", "Aniket Verma",
     ],
@@ -800,26 +800,37 @@ def _find_espn_name(fantasy_name, players_dict):
     Matching order:
       1. Exact string match
       2. Normalized exact match (dots/extra spaces removed, lowercased)
-      3. First-initial + last-name match (handles e.g. 'Mohd.' → 'Mohammed')
-         — only fires when exactly one candidate matches both criteria.
+      3. Prefix-compatible first name + exact last name
+         e.g. 'Mohd.' → 'Mohammed' because 'mohammed'.startswith('mohd') is True
+         but 'Abhishek' ≠ 'Ashok' because neither is a prefix of the other.
+         Only fires when exactly one candidate qualifies.
     """
     if fantasy_name in players_dict:
         return fantasy_name
+
     norm = _normalize_name(fantasy_name)
-    for espn_name in players_dict:
-        if _normalize_name(espn_name) == norm:
-            return espn_name
+    norm_map = {_normalize_name(n): n for n in players_dict}
+
+    if norm in norm_map:
+        return norm_map[norm]
+
     parts = norm.split()
     if len(parts) >= 2:
-        first_initial = parts[0][0]
-        last = parts[-1]
-        candidates = [
-            n for n in players_dict
-            if _normalize_name(n).split()[-1] == last
-            and _normalize_name(n)[0] == first_initial
-        ]
+        first, last = parts[0], parts[-1]
+        candidates = []
+        for espn_name in players_dict:
+            espn_parts = _normalize_name(espn_name).split()
+            if len(espn_parts) < 2:
+                continue
+            if espn_parts[-1] != last:
+                continue
+            espn_first = espn_parts[0]
+            # One first name must be a prefix of the other (handles abbreviations)
+            if first.startswith(espn_first) or espn_first.startswith(first):
+                candidates.append(espn_name)
         if len(candidates) == 1:
             return candidates[0]
+
     return None
 
 
