@@ -30,6 +30,11 @@ SUMMARY_URL_TEMPLATE = (
 )
 HEADERS = {"User-Agent": "Mozilla/5.0"}
 
+# Bypass any system/env proxy so ESPN API is reached directly
+_SESSION = requests.Session()
+_SESSION.trust_env = False
+_SESSION.headers.update(HEADERS)
+
 # ── Fantasy Point Values ──────────────────────────────────────────────
 
 BAT_RUN = 1
@@ -53,6 +58,53 @@ FIELD_CATCH = 8
 FIELD_STUMPING = 12
 FIELD_RUNOUT_DIRECT = 12
 FIELD_RUNOUT_PARTIAL = 6
+
+# ── Fantasy Draft Teams ───────────────────────────────────────────────
+
+FANTASY_TEAMS = {
+    "VS": [
+        "Karthik Sharma", "Prashant Veer", "Kuldeep Yadav", "Sai Sudharsan",
+        "Mohd. Siraj", "Cameron Green", "Ajinkya Rahane", "Wanindu Hasaranga",
+        "Suryakumar Yadav", "Robin Minz", "Prabhsimran Singh", "Yuzvendra Chahal",
+        "Ravindra Jadeja", "Devdut Padikkal", "Krunal Pandya", "Aniket Verma",
+    ],
+    "Sakthi": [
+        "Matt Henry", "KL Rahul", "Nitish Rana", "Jason Holder",
+        "Glenn Phillips", "Finn Allen", "Nicholas Pooran", "Aiden Markram",
+        "Tilak Varma", "Jasprit Bumrah", "Arshdeep Singh", "Riyan Parag",
+        "Nandre Burger", "Rajat Patidar", "Phil Salt", "Zeeshan Ansari",
+    ],
+    "Kama/Bulb": [
+        "Ruturaj Gaikwad", "Shivam Dube", "Axar Patel", "Vipraj Nigam",
+        "Jos Buttler", "Rahul Tewatia", "Vaibhav Arora", "Avesh Khan",
+        "Corbin Bosch", "Trent Boult", "Shasank Singh", "Yashasvi Jaiswal",
+        "Jofra Archer", "Venkatesh Iyer", "Bhuvneshwar Kumar", "Liam Livingstone",
+    ],
+    "Sakhi": [
+        "Dewald Brevis", "Sanju Samson", "Lungi Ngidi", "Rashid Khan",
+        "Sai Kishore", "Rinku Singh", "Angkrish Raghuvanshi", "Ayush Badoni",
+        "Will Jacks", "Priyansh Arya", "Cooper Connolly", "Donovan Ferreira",
+        "Tim David", "Suyash Sharma", "Heinrich Klaasen", "Ishan Kishan",
+    ],
+    "Abi": [
+        "Noor Ahmed", "Khaleel Ahmed", "David Miller", "Washington Sundar",
+        "Tim Seifert", "Varun Chakravarthy", "Shahbaz Ahamad", "Mohammed Shami",
+        "Rohit Sharma", "Ryan Rickelton", "Harpreet Brar", "Dhruv Jurel",
+        "Ravi Bishnoi", "Virat Kohli", "Jacob Bethell", "Nitish Kumar Reddy",
+    ],
+    "Vignesh": [
+        "MS Dhoni", "Akeal Hossain", "Tristan Stubbs", "Prasidh Krishna",
+        "Matheesha Pathirana", "Rishabh Pant", "Mitchell Marsh", "Hardik Pandya",
+        "Deepak Chahar", "Marco Jansen", "Marcus Stoinis", "Shimron Hetmyer",
+        "Sandeep Sharma", "Romario Shepherd", "Abhishek Sharma", "Travis Head",
+    ],
+    "Kums": [
+        "Jamie Overton", "Ayush Mathre", "Abishek Porel", "Auqib Nabi",
+        "Shubman Gill", "Sunil Narine", "Ramandeep Singh", "Digvesh Rathi",
+        "Quinton De Kock", "Shardul Thakur", "Shreyas Iyer", "Vaibhav Sooryavanshi",
+        "Jitesh Sharma", "Josh Hazlewood", "Harshal Patel", "Jaydev Unadkat",
+    ],
+}
 
 BOWLERS = {
     "Noor Ahmed", "Mitchell Starc", "Arshad Khan", "Varun Chakravarthy",
@@ -244,12 +296,17 @@ def fetch_schedule():
     Returns a list of dicts:
         {match_number, event_id, teams, team_abbr, state, status_detail}
     """
-    resp = requests.get(SCOREBOARD_URL, headers=HEADERS, timeout=15)
+    resp = _SESSION.get(SCOREBOARD_URL, timeout=15)
     resp.raise_for_status()
     data = resp.json()
 
+    if "events" not in data:
+        raise ValueError(f"Unexpected API response: {data}")
+
     matches = []
     for i, event in enumerate(data.get("events", []), 1):
+        if not event.get("competitions"):
+            continue
         comp = event["competitions"][0]
         status_type = comp["status"]["type"]
 
@@ -351,7 +408,7 @@ def parse_scorecard(event_id):
         resolver     – NameResolver for mapping short names
     """
     url = SUMMARY_URL_TEMPLATE.format(event_id=event_id)
-    resp = requests.get(url, headers=HEADERS, timeout=15)
+    resp = _SESSION.get(url, timeout=15)
     resp.raise_for_status()
     data = resp.json()
 
@@ -730,9 +787,83 @@ def _build_leaderboard_df(players, match_info):
     return pd.DataFrame(rows)
 
 
+# ── Fantasy Team Helpers ───────────────────────────────────────────────
+
+def _normalize_name(name):
+    """Lowercase, collapse dots and extra whitespace for fuzzy matching."""
+    return re.sub(r"[.\s]+", " ", name).strip().lower()
+
+
+def _find_espn_name(fantasy_name, players_dict):
+    """Return the ESPN display name for a fantasy player, or None if not found.
+
+    Matching order:
+      1. Exact string match
+      2. Normalized exact match (dots/extra spaces removed, lowercased)
+      3. First-initial + last-name match (handles e.g. 'Mohd.' → 'Mohammed')
+         — only fires when exactly one candidate matches both criteria.
+    """
+    if fantasy_name in players_dict:
+        return fantasy_name
+    norm = _normalize_name(fantasy_name)
+    for espn_name in players_dict:
+        if _normalize_name(espn_name) == norm:
+            return espn_name
+    parts = norm.split()
+    if len(parts) >= 2:
+        first_initial = parts[0][0]
+        last = parts[-1]
+        candidates = [
+            n for n in players_dict
+            if _normalize_name(n).split()[-1] == last
+            and _normalize_name(n)[0] == first_initial
+        ]
+        if len(candidates) == 1:
+            return candidates[0]
+    return None
+
+
+def _build_fantasy_team_df(fantasy_players, players, innings_list):
+    """Build a per-player points breakdown DataFrame for one fantasy team."""
+    bat_stats = {}
+    bowl_stats = {}
+    for inn in innings_list:
+        for b in inn["batting"]:
+            bat_stats[b["name"]] = b
+        for b in inn["bowling"]:
+            bowl_stats[b["name"]] = b
+
+    rows = []
+    for fantasy_name in fantasy_players:
+        espn_name = _find_espn_name(fantasy_name, players)
+        if not espn_name:
+            continue  # didn't play in this match
+        data = players[espn_name]
+        bat = bat_stats.get(espn_name)
+        bowl = bowl_stats.get(espn_name)
+        parts = []
+        if bat:
+            s = f"{bat['runs']}({bat['balls']})"
+            if bat["fours"] or bat["sixes"]:
+                s += f"  {bat['fours']}×4 {bat['sixes']}×6"
+            parts.append(s)
+        if bowl and (bowl["wickets"] or bowl["overs"] != "0"):
+            parts.append(f"{bowl['wickets']}/{bowl['runs']} ({bowl['overs']}ov)")
+        rows.append({
+            "Player": espn_name,
+            "Stats": "  |  ".join(parts) if parts else "—",
+            "Bat": data["bat_pts"],
+            "Bowl": data["bowl_pts"],
+            "Field": data["field_pts"],
+            "Total": data["total"],
+        })
+
+    return pd.DataFrame(rows).sort_values("Total", ascending=False)
+
+
 # ── Streamlit UI ──────────────────────────────────────────────────────
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=30, show_spinner=False)
 def cached_schedule():
     return fetch_schedule()
 
@@ -793,6 +924,9 @@ def main():
             f"/{event_id}/full-scorecard"
         )
         st.caption(f"[Scorecard on ESPNcricinfo]({scorecard_url})")
+        if st.button("Clear cache & reload"):
+            st.cache_data.clear()
+            st.rerun()
 
     is_live = match["state"] == "in"
     match_info, innings_list, resolver = get_scorecard(event_id, is_live=is_live)
@@ -809,32 +943,66 @@ def main():
     if match_info.get("result"):
         st.markdown(f"**{match_info['result']}**")
 
-    teams = match_info.get("teams", [])
-    abbr = match_info.get("team_abbr", {})
-    tab_labels = [abbr.get(t, t[:3].upper()) for t in teams] + ["Leaderboard"]
-    tabs = st.tabs(tab_labels)
+    tab_fantasy, tab_match, tab_lb = st.tabs(["Fantasy Teams", "Match", "Leaderboard"])
 
-    for i, team in enumerate(teams):
-        with tabs[i]:
+    # ── Fantasy Teams tab ─────────────────────────────────────────────
+    with tab_fantasy:
+        # Rank teams by their combined total for this match
+        team_totals = {}
+        for team_name, roster in FANTASY_TEAMS.items():
+            total = 0
+            for fantasy_name in roster:
+                espn_name = _find_espn_name(fantasy_name, players)
+                if espn_name:
+                    total += players[espn_name]["total"]
+            team_totals[team_name] = total
+
+        sorted_teams = sorted(team_totals.items(), key=lambda x: x[1], reverse=True)
+
+        col_config = {
+            "Total": st.column_config.NumberColumn(format="%d"),
+            "Bat": st.column_config.NumberColumn(format="%d"),
+            "Bowl": st.column_config.NumberColumn(format="%d"),
+            "Field": st.column_config.NumberColumn(format="%d"),
+        }
+
+        for rank, (team_name, team_total) in enumerate(sorted_teams, 1):
+            with st.expander(
+                f"#{rank}  **{team_name}** — {team_total} pts", expanded=True
+            ):
+                df = _build_fantasy_team_df(
+                    FANTASY_TEAMS[team_name], players, innings_list
+                )
+                st.dataframe(
+                    df,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config=col_config,
+                )
+
+    # ── Match tab (cricket teams) ─────────────────────────────────────
+    with tab_match:
+        match_teams = match_info.get("teams", [])
+        for team in match_teams:
             df = _build_team_df(players, innings_list, team)
+            st.subheader(team)
             if df.empty:
                 st.info("No player data available.")
-                continue
+            else:
+                st.dataframe(
+                    df,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "Total": st.column_config.NumberColumn(format="%d"),
+                        "Bat": st.column_config.NumberColumn(format="%d"),
+                        "Bowl": st.column_config.NumberColumn(format="%d"),
+                        "Field": st.column_config.NumberColumn(format="%d"),
+                    },
+                )
 
-            st.subheader(team)
-            st.dataframe(
-                df,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Total": st.column_config.NumberColumn(format="%d"),
-                    "Bat": st.column_config.NumberColumn(format="%d"),
-                    "Bowl": st.column_config.NumberColumn(format="%d"),
-                    "Field": st.column_config.NumberColumn(format="%d"),
-                },
-            )
-
-    with tabs[-1]:
+    # ── Leaderboard tab ───────────────────────────────────────────────
+    with tab_lb:
         st.subheader("Fantasy Points Leaderboard")
         lb = _build_leaderboard_df(players, match_info)
         st.dataframe(
