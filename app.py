@@ -869,6 +869,8 @@ def _build_fantasy_team_df(fantasy_players, players, innings_list):
             "Total": data["total"],
         })
 
+    if not rows:
+        return pd.DataFrame(columns=["Player", "Stats", "Bat", "Bowl", "Field", "Total"])
     return pd.DataFrame(rows).sort_values("Total", ascending=False)
 
 
