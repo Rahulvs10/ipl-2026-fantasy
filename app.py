@@ -87,7 +87,7 @@ FANTASY_TEAMS = {
         "Tim David", "Suyash Sharma", "Heinrich Klaasen", "Ishan Kishan",
     ],
     "Abi": [
-        "Noor Ahmed", "Khaleel Ahmed", "David Miller", "Washington Sundar",
+        "Noor Ahmad", "Khaleel Ahmed", "David Miller", "Washington Sundar",
         "Tim Seifert", "Varun Chakravarthy", "Shahbaz Ahamad", "Mohammed Shami",
         "Rohit Sharma", "Ryan Rickelton", "Harpreet Brar", "Dhruv Jurel",
         "Ravi Bishnoi", "Virat Kohli", "Jacob Bethell", "Nitish Kumar Reddy",
@@ -99,7 +99,7 @@ FANTASY_TEAMS = {
         "Sandeep Sharma", "Romario Shepherd", "Abhishek Sharma", "Travis Head",
     ],
     "Kums": [
-        "Jamie Overton", "Ayush Mathre", "Abishek Porel", "Auqib Nabi",
+        "Jamie Overton", "Ayush Mhatre", "Abishek Porel", "Auqib Nabi",
         "Shubman Gill", "Sunil Narine", "Ramandeep Singh", "Digvesh Rathi",
         "Quinton De Kock", "Shardul Thakur", "Shreyas Iyer", "Vaibhav Sooryavanshi",
         "Jitesh Sharma", "Josh Hazlewood", "Harshal Patel", "Jaydev Unadkat",
@@ -107,7 +107,7 @@ FANTASY_TEAMS = {
 }
 
 BOWLERS = {
-    "Noor Ahmed", "Mitchell Starc", "Arshad Khan", "Varun Chakravarthy",
+    "Noor Ahmad", "Mitchell Starc", "Arshad Khan", "Varun Chakravarthy",
     "Mayank Yadav", "Mitchell Santner", "Arshdeep Singh", "Jofra Archer",
     "Josh Hazlewood", "Shivam Mavi", "Khaleel Ahmed", "T Natarajan",
     "Kagiso Rabada", "Navdeep Saini", "Avesh Khan", "Trent Boult",
