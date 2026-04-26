@@ -63,7 +63,7 @@ FIELD_RUNOUT_PARTIAL = 6
 
 FANTASY_TEAMS = {
     "VS": [
-        "Karthik Sharma", "Prashant Veer", "Kuldeep Yadav", "Sai Sudharsan",
+        "Kartik Sharma", "Prashant Veer", "Kuldeep Yadav", "Sai Sudharsan",
         "Mohammed Siraj", "Cameron Green", "Ajinkya Rahane", "Wanindu Hasaranga",
         "Suryakumar Yadav", "Robin Minz", "Prabhsimran Singh", "Yuzvendra Chahal",
         "Ravindra Jadeja", "Devdut Padikkal", "Krunal Pandya", "Aniket Verma",
@@ -77,7 +77,7 @@ FANTASY_TEAMS = {
     "Kama/Bulb": [
         "Ruturaj Gaikwad", "Shivam Dube", "Axar Patel", "Vipraj Nigam",
         "Jos Buttler", "Rahul Tewatia", "Vaibhav Arora", "Avesh Khan",
-        "Corbin Bosch", "Trent Boult", "Shasank Singh", "Yashasvi Jaiswal",
+        "Corbin Bosch", "Trent Boult", "Shashank Singh", "Yashasvi Jaiswal",
         "Jofra Archer", "Venkatesh Iyer", "Bhuvneshwar Kumar", "Liam Livingstone",
     ],
     "Sakhi": [
@@ -87,7 +87,7 @@ FANTASY_TEAMS = {
         "Tim David", "Suyash Sharma", "Heinrich Klaasen", "Ishan Kishan",
     ],
     "Abi": [
-        "Noor Ahmad", "Khaleel Ahmed", "David Miller", "Washington Sundar",
+        "Noor Ahmad", "Anshul Kamboj", "David Miller", "Washington Sundar",
         "Tim Seifert", "Varun Chakravarthy", "Shahbaz Ahamad", "Mohammed Shami",
         "Rohit Sharma", "Ryan Rickelton", "Harpreet Brar", "Dhruv Jurel",
         "Ravi Bishnoi", "Virat Kohli", "Jacob Bethell", "Nitish Kumar Reddy",
